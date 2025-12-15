@@ -652,28 +652,28 @@ esp_err_t cam_deinit(void)
     ll_cam_deinit(cam_obj);
 
     if (cam_obj->dma) {
-        free(cam_obj->dma);
+        heap_caps_free(cam_obj->dma);
     }
     if (cam_obj->dma_buffer) {
-        free(cam_obj->dma_buffer);
+        heap_caps_free(cam_obj->dma_buffer);
     }
     
     if (cam_obj->frames) {
         for (int x = 0; x < cam_obj->frame_cnt; x++) {
-            // restore original pointer for free 
+            // restore original pointer before free
             if (cam_obj->frames[x].fb.buf) {
                 uint8_t *original_ptr = cam_obj->frames[x].fb.buf - cam_obj->frames[x].fb_offset;
 #if ESP_IDF_VERSION >= ESP_IDF_VERSION_VAL(4, 3, 0)
-                heap_caps_aligned_free(original_ptr);
+                heap_caps_free(original_ptr);
 #else
                 free(original_ptr);
 #endif
             }
             if (cam_obj->frames[x].dma) {
-                free(cam_obj->frames[x].dma);
+                heap_caps_free(cam_obj->frames[x].dma);
             }
         }
-        free(cam_obj->frames);
+        heap_caps_free(cam_obj->frames);
     }
 
     free(cam_obj);
