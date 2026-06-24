@@ -20,6 +20,7 @@
 #include "freertos/task.h"
 #include "ll_cam.h"
 #include "cam_hal.h"
+#include "cam_jpeg_budget.h"
 
 #if (ESP_IDF_VERSION_MAJOR == 3) && (ESP_IDF_VERSION_MINOR == 3)
 #include "rom/ets_sys.h"
@@ -135,13 +136,6 @@ static const uint8_t JPEG_SOI_MARKER[] = {0xFF, 0xD8, 0xFF}; /* SOI = FF D8 FF *
 static const uint8_t JPEG_EOI_BYTES[] = {0xFF, 0xD9};        /* EOI = FF D9 */
 #define JPEG_EOI_MARKER_LEN (2)
 
-/* Compute the scan window for JPEG EOI detection in PSRAM. */
-static inline size_t eoi_probe_window(size_t half, size_t frame_len)
-{
-    size_t w = half + (JPEG_EOI_MARKER_LEN - 1);
-    return w > frame_len ? frame_len : w;
-}
-
 static int cam_verify_jpeg_soi(const uint8_t *inbuf, uint32_t length)
 {
     static uint16_t warn_soi_miss_cnt = 0;
@@ -215,6 +209,26 @@ static int cam_verify_jpeg_eoi(const uint8_t *inbuf, uint32_t length, bool searc
         dptr--;
     }
     return -1;
+}
+
+/* One-shot diagnostic for persistent NO-EOI in PSRAM mode: locate the first
+ * 0xFFD9 across the whole frame buffer and report its offset relative to the
+ * freshly-written length, so a residual failure (EOI beyond len / genuinely
+ * absent) is self-diagnosing instead of a blind retry. Throttled by the caller. */
+static void cam_log_eoi_diag(const uint8_t *buf, size_t len, size_t recv_size)
+{
+    if (recv_size > len) {
+        cam_drop_psram_cache((void *)(buf + len), recv_size - len);
+    }
+    int off = cam_verify_jpeg_eoi(buf, (uint32_t)recv_size, true);
+    if (off >= 0) {
+        ESP_LOGW(TAG, "NO-EOI diag: FFD9 at %u (len=%u recv=%u, %s)",
+                 (unsigned)off, (unsigned)len, (unsigned)recv_size,
+                 off < (int)len ? "in-frame" : "beyond-len(stale/cut)");
+    } else {
+        ESP_LOGW(TAG, "NO-EOI diag: no FFD9 anywhere in [0,%u] (len=%u) - sensor not emitting EOI?",
+                 (unsigned)recv_size, (unsigned)len);
+    }
 }
 
 static bool cam_get_next_frame(int * frame_pos)
@@ -585,7 +599,7 @@ esp_err_t cam_config(const camera_config_t *config, framesize_t frame_size, uint
 
     if(cam_obj->jpeg_mode){
 #ifdef CONFIG_CAMERA_JPEG_MODE_FRAME_SIZE_AUTO
-        cam_obj->recv_size = cam_obj->width * cam_obj->height / 5;
+        cam_obj->recv_size = cam_jpeg_recv_size(cam_obj->width, cam_obj->height, sensor_pid);
 #else
         cam_obj->recv_size = CONFIG_CAMERA_JPEG_MODE_FRAME_SIZE;
 #endif
@@ -705,6 +719,8 @@ camera_fb_t *cam_take(TickType_t timeout)
 #endif
     /* throttle repeated NO-EOI warnings */
     static uint16_t warn_eoi_miss_cnt = 0;
+    /* one-shot full-buffer EOI diagnostic (PSRAM mode only) */
+    static uint16_t warn_eoi_diag_cnt = 0;
 
     for (;;)
     {
@@ -746,22 +762,22 @@ camera_fb_t *cam_take(TickType_t timeout)
             /* find the end marker for JPEG. Data after that can be discarded */
             int offset_e = -1;
             if (cam_obj->psram_mode) {
-                /* Search forward from (JPEG_EOI_MARKER_LEN - 1) bytes before the final
-                 * DMA block. We prefer forward search to pick the earliest EOI in the
-                 * last DMA node, avoiding stale markers from a larger prior frame. */
-                size_t probe_len = eoi_probe_window(cam_obj->dma_node_buffer_size,
-                                                   dma_buffer->len);
-                if (probe_len < JPEG_EOI_MARKER_LEN) {
-                    goto skip_eoi_check;
-                }
-                uint8_t *probe_start = dma_buffer->buf + dma_buffer->len - probe_len;
-                cam_drop_psram_cache(probe_start, probe_len);
-                int off = cam_verify_jpeg_eoi(probe_start, probe_len, true);
-                if (off >= 0) {
-                    offset_e = dma_buffer->len - probe_len + off;
+                /* Scan the full freshly-written region [0, len) for the JPEG EOI.
+                 * JPEG entropy data escapes 0xFF as 0xFF00, so the first 0xFFD9 in
+                 * this region is the true end-of-image. The previous last-node-only
+                 * probe (~1 KB) missed the EOI whenever the sensor emitted >1 KB of
+                 * trailing data after the JPEG end within the same VSYNC window
+                 * (OV3660 at VGA), yielding NO-EOI on every frame. Bytes at/after
+                 * len are stale from a larger prior frame, so we never scan past len. */
+                if (dma_buffer->len >= JPEG_EOI_MARKER_LEN) {
+                    cam_drop_psram_cache(dma_buffer->buf, dma_buffer->len);
+                    int off = cam_verify_jpeg_eoi(dma_buffer->buf, (uint32_t)dma_buffer->len, true);
+                    if (off >= 0) {
+                        offset_e = off;
+                    }
                 }
             } else {
-                offset_e = cam_verify_jpeg_eoi(dma_buffer->buf, dma_buffer->len, false);
+                offset_e = cam_verify_jpeg_eoi(dma_buffer->buf, (uint32_t)dma_buffer->len, false);
             }
 
             if (offset_e >= 0) {
@@ -773,8 +789,10 @@ camera_fb_t *cam_take(TickType_t timeout)
                 return dma_buffer;
             }
 
-skip_eoi_check:
-
+            if (cam_obj->psram_mode && warn_eoi_diag_cnt < 2u) {
+                warn_eoi_diag_cnt++;
+                cam_log_eoi_diag(dma_buffer->buf, dma_buffer->len, cam_obj->recv_size);
+            }
             CAM_WARN_THROTTLE(warn_eoi_miss_cnt,
                               "NO-EOI - JPEG end marker missing");
             cam_give(dma_buffer);
