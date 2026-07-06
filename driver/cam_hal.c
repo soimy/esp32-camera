@@ -21,6 +21,7 @@
 #include "ll_cam.h"
 #include "cam_hal.h"
 #include "cam_jpeg_budget.h"
+#include "cam_jpeg_eoi_recover.h"
 
 #if (ESP_IDF_VERSION_MAJOR == 3) && (ESP_IDF_VERSION_MINOR == 3)
 #include "rom/ets_sys.h"
@@ -767,13 +768,33 @@ camera_fb_t *cam_take(TickType_t timeout)
                  * this region is the true end-of-image. The previous last-node-only
                  * probe (~1 KB) missed the EOI whenever the sensor emitted >1 KB of
                  * trailing data after the JPEG end within the same VSYNC window
-                 * (OV3660 at VGA), yielding NO-EOI on every frame. Bytes at/after
-                 * len are stale from a larger prior frame, so we never scan past len. */
+                 * (OV3660 at VGA), yielding NO-EOI on every frame. If VSYNC cuts
+                 * off the final DMA half-buffer accounting, allow one bounded
+                 * half-buffer scan beyond len, but never trust arbitrary stale tail. */
                 if (dma_buffer->len >= JPEG_EOI_MARKER_LEN) {
                     cam_drop_psram_cache(dma_buffer->buf, dma_buffer->len);
                     int off = cam_verify_jpeg_eoi(dma_buffer->buf, (uint32_t)dma_buffer->len, true);
                     if (off >= 0) {
                         offset_e = off;
+                    } else if (cam_obj->recv_size > dma_buffer->len) {
+                        size_t eoi_offset = 0;
+                        size_t extra_len = cam_obj->recv_size - dma_buffer->len;
+                        size_t scan_extra = cam_obj->dma_half_buffer_size;
+                        if (scan_extra > extra_len) {
+                            scan_extra = extra_len;
+                        }
+                        cam_drop_psram_cache(dma_buffer->buf + dma_buffer->len, scan_extra);
+                        if (cam_jpeg_find_recoverable_eoi(dma_buffer->buf,
+                                                          dma_buffer->len,
+                                                          cam_obj->recv_size,
+                                                          cam_obj->dma_half_buffer_size,
+                                                          &eoi_offset)) {
+                            ESP_LOGW(TAG, "Recovered JPEG EOI beyond reported len: FFD9 at %u (len=%u recv=%u)",
+                                     (unsigned)eoi_offset,
+                                     (unsigned)dma_buffer->len,
+                                     (unsigned)cam_obj->recv_size);
+                            offset_e = (int)eoi_offset;
+                        }
                     }
                 }
             } else {
