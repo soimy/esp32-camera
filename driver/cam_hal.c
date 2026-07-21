@@ -136,6 +136,13 @@ static const uint8_t JPEG_SOI_MARKER[] = {0xFF, 0xD8, 0xFF}; /* SOI = FF D8 FF *
 #define JPEG_SOI_MARKER_LEN (3)
 static const uint8_t JPEG_EOI_BYTES[] = {0xFF, 0xD9};        /* EOI = FF D9 */
 #define JPEG_EOI_MARKER_LEN (2)
+static bool s_needs_full_eoi_recovery;
+
+static inline size_t eoi_probe_window(size_t half, size_t frame_len)
+{
+    size_t window = half + (JPEG_EOI_MARKER_LEN - 1);
+    return window > frame_len ? frame_len : window;
+}
 
 static int cam_verify_jpeg_soi(const uint8_t *inbuf, uint32_t length)
 {
@@ -597,6 +604,9 @@ esp_err_t cam_config(const camera_config_t *config, framesize_t frame_size, uint
     cam_obj->frame_cnt = config->fb_count;
     cam_obj->width = resolution[frame_size].width;
     cam_obj->height = resolution[frame_size].height;
+    s_needs_full_eoi_recovery =
+        sensor_pid == CAM_JPEG_BUDGET_OV3660_PID ||
+        sensor_pid == CAM_JPEG_BUDGET_OV5640_PID;
 
     if(cam_obj->jpeg_mode){
 #ifdef CONFIG_CAMERA_JPEG_MODE_FRAME_SIZE_AUTO
@@ -763,37 +773,38 @@ camera_fb_t *cam_take(TickType_t timeout)
             /* find the end marker for JPEG. Data after that can be discarded */
             int offset_e = -1;
             if (cam_obj->psram_mode) {
-                /* Scan the full freshly-written region [0, len) for the JPEG EOI.
-                 * JPEG entropy data escapes 0xFF as 0xFF00, so the first 0xFFD9 in
-                 * this region is the true end-of-image. The previous last-node-only
-                 * probe (~1 KB) missed the EOI whenever the sensor emitted >1 KB of
-                 * trailing data after the JPEG end within the same VSYNC window
-                 * (OV3660 at VGA), yielding NO-EOI on every frame. If VSYNC cuts
-                 * off the final DMA half-buffer accounting, allow one bounded
-                 * half-buffer scan beyond len, but never trust arbitrary stale tail. */
-                if (dma_buffer->len >= JPEG_EOI_MARKER_LEN) {
-                    cam_drop_psram_cache(dma_buffer->buf, dma_buffer->len);
-                    int off = cam_verify_jpeg_eoi(dma_buffer->buf, (uint32_t)dma_buffer->len, true);
+                size_t probe_len = eoi_probe_window(cam_obj->dma_node_buffer_size,
+                                                    dma_buffer->len);
+                if (probe_len >= JPEG_EOI_MARKER_LEN) {
+                    uint8_t *probe_start = dma_buffer->buf + dma_buffer->len - probe_len;
+                    cam_drop_psram_cache(probe_start, probe_len);
+                    int off = cam_verify_jpeg_eoi(probe_start, (uint32_t)probe_len, true);
                     if (off >= 0) {
-                        offset_e = off;
-                    } else if (cam_obj->recv_size > dma_buffer->len) {
-                        size_t eoi_offset = 0;
-                        size_t extra_len = cam_obj->recv_size - dma_buffer->len;
-                        size_t scan_extra = cam_obj->dma_half_buffer_size;
-                        if (scan_extra > extra_len) {
-                            scan_extra = extra_len;
-                        }
-                        cam_drop_psram_cache(dma_buffer->buf + dma_buffer->len, scan_extra);
-                        if (cam_jpeg_find_recoverable_eoi(dma_buffer->buf,
-                                                          dma_buffer->len,
-                                                          cam_obj->recv_size,
-                                                          cam_obj->dma_half_buffer_size,
-                                                          &eoi_offset)) {
-                            ESP_LOGW(TAG, "Recovered JPEG EOI beyond reported len: FFD9 at %u (len=%u recv=%u)",
-                                     (unsigned)eoi_offset,
-                                     (unsigned)dma_buffer->len,
-                                     (unsigned)cam_obj->recv_size);
-                            offset_e = (int)eoi_offset;
+                        offset_e = (int)(dma_buffer->len - probe_len) + off;
+                    } else if (s_needs_full_eoi_recovery) {
+                        cam_drop_psram_cache(dma_buffer->buf, dma_buffer->len);
+                        off = cam_verify_jpeg_eoi(dma_buffer->buf, (uint32_t)dma_buffer->len, true);
+                        if (off >= 0) {
+                            offset_e = off;
+                        } else if (cam_obj->recv_size > dma_buffer->len) {
+                            size_t eoi_offset = 0;
+                            size_t extra_len = cam_obj->recv_size - dma_buffer->len;
+                            size_t scan_extra = cam_obj->dma_half_buffer_size;
+                            if (scan_extra > extra_len) {
+                                scan_extra = extra_len;
+                            }
+                            cam_drop_psram_cache(dma_buffer->buf + dma_buffer->len, scan_extra);
+                            if (cam_jpeg_find_recoverable_eoi(dma_buffer->buf,
+                                                              dma_buffer->len,
+                                                              cam_obj->recv_size,
+                                                              cam_obj->dma_half_buffer_size,
+                                                              &eoi_offset)) {
+                                ESP_LOGW(TAG, "Recovered JPEG EOI beyond reported len: FFD9 at %u (len=%u recv=%u)",
+                                         (unsigned)eoi_offset,
+                                         (unsigned)dma_buffer->len,
+                                         (unsigned)cam_obj->recv_size);
+                                offset_e = (int)eoi_offset;
+                            }
                         }
                     }
                 }
@@ -810,7 +821,8 @@ camera_fb_t *cam_take(TickType_t timeout)
                 return dma_buffer;
             }
 
-            if (cam_obj->psram_mode && warn_eoi_diag_cnt < 2u) {
+            if (cam_obj->psram_mode && s_needs_full_eoi_recovery &&
+                warn_eoi_diag_cnt < 2u) {
                 warn_eoi_diag_cnt++;
                 cam_log_eoi_diag(dma_buffer->buf, dma_buffer->len, cam_obj->recv_size);
             }
